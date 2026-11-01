@@ -1,6 +1,6 @@
 // ============================================================
 //  MetaProfiler - Persistent Player Profile Engine for AMX Mod X
-//  Version: 1.0.0
+//  Version: 1.1.0
 //
 //  Every player gets one .ini profile file:
 //      addons/amxmodx/data/metaprofiler/<key>.ini
@@ -19,7 +19,8 @@
 //   - Atomic saves (write .tmp then replace), dirty tracking
 //   - Directory scan (list every profile on disk)
 //
-//  Optional but recommended - in moduleconfig.h enable:
+//  In moduleconfig.h enable BOTH (needed for the forwards, recommended anyway):
+//     #define FN_AMXX_PLUGINSLOADED   OnPluginsLoaded
 //     #define FN_AMXX_PLUGINSUNLOADED OnPluginsUnloaded
 // ============================================================
 
@@ -29,6 +30,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +50,8 @@
 	#define MP_MKDIR(p) mkdir(p, 0755)
 #endif
 
-#define MP_VERSION    "1.0.0"
+#define MP_VERSION    "1.1.0"
+#define MP_VERSION_NUM  110
 #define MP_OUT        MF_PrintSrvConsole
 #define MP_DATA_DIR   "addons/amxmodx/data/metaprofiler"
 
@@ -136,6 +139,13 @@ static unsigned int             g_Saves      = 0;
 static unsigned int             g_Loads      = 0;
 static std::vector<std::string> g_Scan;
 
+// forwards (registered in OnPluginsLoaded)
+static int  g_FwdCreated = -1;
+static int  g_FwdLoaded  = -1;
+static int  g_FwdClosing = -1;
+static int  g_FwdRenamed = -1;
+static bool g_FwdsReady  = false;
+
 // ============================================================
 //  String helpers
 // ============================================================
@@ -199,7 +209,7 @@ static std::string NowString(time_t t = 0)
 {
 	if (!t) t = time(nullptr);
 	struct tm* lt = localtime(&t);
-	char buf[32];
+	char buf[96];
 	if (lt)
 		snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
 			lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday, lt->tm_hour, lt->tm_min, lt->tm_sec);
@@ -301,6 +311,16 @@ static bool FileExists(const std::string& path)
 	if (!f) return false;
 	fclose(f);
 	return true;
+}
+
+/* Replaces path with tmp in one step: the old file is never missing in between */
+static bool ReplaceFile(const std::string& tmp, const std::string& path)
+{
+#ifdef _WIN32
+	return MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+	return rename(tmp.c_str(), path.c_str()) == 0;
+#endif
 }
 
 // ============================================================
@@ -570,8 +590,7 @@ static bool SaveProfile(Profile& p)
 		return false;
 	}
 
-	remove(path.c_str());		// Windows can't rename over an existing file
-	if (rename(tmp.c_str(), path.c_str()) != 0)
+	if (!ReplaceFile(tmp, path))
 	{
 		MP_OUT("[MetaProfiler] ERROR: cannot replace %s\n", path.c_str());
 		return false;
@@ -582,11 +601,15 @@ static bool SaveProfile(Profile& p)
 	return true;
 }
 
+static void SaveAllIndexes();
+
 static void SaveAll()
 {
 	for (size_t i = 0; i < g_Profiles.size(); i++)
 		if (g_Profiles[i].used && g_Profiles[i].dirty)
 			SaveProfile(g_Profiles[i]);
+
+	SaveAllIndexes();
 }
 
 // ============================================================
@@ -603,6 +626,13 @@ static unsigned int NextGen()
 static cell MakeHandle(int slot)
 {
 	return (cell)((g_Profiles[slot].gen << 8) | (unsigned int)(slot + 1));
+}
+
+/* fires a forward with (player id, profile handle) */
+static void FireProfileFwd(int fwd, int id, int slot)
+{
+	if (!g_FwdsReady || fwd < 0) return;
+	MF_ExecuteForward(fwd, (cell)id, MakeHandle(slot));
 }
 
 static Profile* HandleToProfile(cell h)
@@ -654,6 +684,10 @@ static int LoadProfileSlot(const std::string& key, bool create, bool* created)
 
 	std::string path = ProfilePath(key);
 	bool exists = FileExists(path);
+
+	// crash recovery: the .ini is missing but a finished .tmp is still there
+	if (!exists && FileExists(path + ".tmp") && ReplaceFile(path + ".tmp", path))
+		exists = true;
 	if (!exists && !create) return -1;
 
 	s = AcquireSlot();
@@ -711,6 +745,9 @@ static cell DoDisconnect(int id)
 		snprintf(buf, sizeof(buf), "disconnected (session %ldm %lds)", sess / 60, sess % 60);
 		AddLog(p, MPL_HISTORY, buf);
 
+		// plugins can still write to the profile here
+		FireProfileFwd(g_FwdClosing, id, ps.slot);
+
 		if (p.online > 0) p.online--;
 		SaveProfile(p);
 	}
@@ -763,7 +800,12 @@ static cell DoConnect(int id, const std::string& name, const std::string& authid
 	snprintf(buf, sizeof(buf), "connected as '%s' (%s) from %s%s", name.c_str(), authid.c_str(), ip.c_str(), created ? " [NEW PROFILE]" : "");
 	AddLog(p, MPL_HISTORY, buf);
 
-	return MakeHandle(s);
+	cell handle = MakeHandle(s);
+
+	if (created) FireProfileFwd(g_FwdCreated, id, s);
+	FireProfileFwd(g_FwdLoaded, id, s);
+
+	return handle;
 }
 
 static cell DoRename(int id, const std::string& newName)
@@ -777,11 +819,17 @@ static cell DoRename(int id, const std::string& newName)
 	if (g_KeyMode == MPK_NAME)
 	{
 		// the profile follows the name -> switch profile
+		cell oldHandle = MakeHandle(ps.slot);
+
 		AddLog(g_Profiles[ps.slot], MPL_HISTORY, "changed name to '" + newName + "'");
 		DoDisconnect(id);
 		cell h = DoConnect(id, newName, ps.authid, ps.ip);
 		Profile* np = HandleToProfile(h);
 		if (np) AddLog(*np, MPL_HISTORY, "name changed from '" + ps.name + "'");
+
+		if (g_FwdsReady && g_FwdRenamed >= 0)
+			MF_ExecuteForward(g_FwdRenamed, (cell)id, oldHandle, h);
+
 		return h;
 	}
 
@@ -878,6 +926,371 @@ static void PrintProfile(Profile& p, int slot)
 	}
 	PrintLine('=', 70);
 	MP_OUT("\n");
+}
+
+// ============================================================
+//  Indexes: independent key / column tables (no link to profiles)
+//  addons/amxmodx/data/metaprofiler/indexes/<name>.ini
+// ============================================================
+
+#define MP_MAX_INDEXES   16
+#define MP_IDX_KEYLEN    64
+#define MP_IDX_DIR       MP_DATA_DIR "/indexes"
+
+struct IdxRow
+{
+	std::string     key;
+	std::vector<KV> cols;
+};
+
+struct IdxSorted
+{
+	std::string      id;       // column (lower case) + '+' (ascending) or '-' (descending)
+	std::vector<int> order;    // row numbers, best first
+};
+
+struct Index
+{
+	bool         used;
+	unsigned int gen;
+	std::string  name;
+	bool         dirty;
+
+	std::vector<IdxRow>                   rows;
+	std::unordered_map<std::string, int>  map;      // lower case key -> row number
+	std::vector<IdxSorted>                cache;    // sorted views, cleared on every change
+
+	Index() : used(false), gen(0), dirty(false) {}
+};
+
+static std::vector<Index> g_Indexes;
+static unsigned int       g_IdxGen = 0;
+
+static unsigned int NextIdxGen()
+{
+	g_IdxGen = (g_IdxGen + 1) & 0x7FFFFF;
+	if (g_IdxGen == 0) g_IdxGen = 1;
+	return g_IdxGen;
+}
+
+static std::string IdxPath(const std::string& name)
+{
+	char buf[640];
+	MF_BuildPathnameR(buf, sizeof(buf), "%s/%s.ini", MP_IDX_DIR, name.c_str());
+	return buf;
+}
+
+static void EnsureIdxDir()
+{
+	EnsureDir();
+	char dir[512];
+	MF_BuildPathnameR(dir, sizeof(dir), "%s", MP_IDX_DIR);
+	MP_MKDIR(dir);
+}
+
+/* row key: same cleaning as section names, max 64 characters */
+static std::string IdxKey(const std::string& raw)
+{
+	std::string k = CleanToken(raw);
+	if (k.size() > MP_IDX_KEYLEN) k.resize(MP_IDX_KEYLEN);
+	return Trimmed(k);
+}
+
+static cell IdxHandle(int slot)
+{
+	return (cell)((g_Indexes[slot].gen << 8) | (unsigned int)(slot + 1));
+}
+
+static Index* IdxFromHandle(cell h)
+{
+	if (h <= 0) return nullptr;
+
+	int slot = (int)(h & 0xFF) - 1;
+	if (slot < 0 || slot >= MP_MAX_INDEXES) return nullptr;
+
+	Index& ix = g_Indexes[slot];
+	if (!ix.used || (cell)ix.gen != (h >> 8)) return nullptr;
+	return &ix;
+}
+
+static int IdxFindRow(Index& ix, const std::string& key)
+{
+	std::unordered_map<std::string, int>::iterator it = ix.map.find(Lower(key));
+	return (it == ix.map.end()) ? -1 : it->second;
+}
+
+static int IdxAddRow(Index& ix, const std::string& key)
+{
+	IdxRow r;
+	r.key = key;
+	ix.rows.push_back(r);
+
+	int n = (int)ix.rows.size() - 1;
+	ix.map[Lower(key)] = n;
+	return n;
+}
+
+static void IdxRemoveRow(Index& ix, int n)
+{
+	ix.map.erase(Lower(ix.rows[n].key));
+
+	int last = (int)ix.rows.size() - 1;
+	if (n != last)
+	{
+		ix.rows[n] = ix.rows[last];
+		ix.map[Lower(ix.rows[n].key)] = n;
+	}
+	ix.rows.pop_back();
+
+	ix.cache.clear();
+	ix.dirty = true;
+}
+
+static bool IdxSet(Index& ix, const std::string& keyRaw, const std::string& colRaw, const std::string& val)
+{
+	std::string key = IdxKey(keyRaw), col = CleanToken(colRaw);
+	if (key.empty() || col.empty())
+		return false;
+
+	int n = IdxFindRow(ix, key);
+	if (n < 0) n = IdxAddRow(ix, key);
+
+	std::string v = CleanValue(val);
+	std::vector<KV>& cols = ix.rows[n].cols;
+
+	for (size_t i = 0; i < cols.size(); i++)
+	{
+		if (IEq(cols[i].key, col))
+		{
+			if (cols[i].val == v) return true;
+			cols[i].val = v;
+			ix.dirty = true;
+			ix.cache.clear();
+			return true;
+		}
+	}
+
+	KV kv;
+	kv.key = col;
+	kv.val = v;
+	cols.push_back(kv);
+
+	ix.dirty = true;
+	ix.cache.clear();
+	return true;
+}
+
+static bool IdxGet(Index& ix, const std::string& keyRaw, const std::string& colRaw, std::string& out)
+{
+	int n = IdxFindRow(ix, IdxKey(keyRaw));
+	if (n < 0) return false;
+
+	std::string col = CleanToken(colRaw);
+	std::vector<KV>& cols = ix.rows[n].cols;
+
+	for (size_t i = 0; i < cols.size(); i++)
+	{
+		if (IEq(cols[i].key, col))
+		{
+			out = cols[i].val;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* numeric value of a column (ok = false if the row has no such column or it is empty) */
+static double IdxNum(IdxRow& r, const std::string& col, bool& ok)
+{
+	ok = false;
+	for (size_t i = 0; i < r.cols.size(); i++)
+	{
+		if (IEq(r.cols[i].key, col))
+		{
+			if (r.cols[i].val.empty()) return 0.0;
+			ok = true;
+			return strtod(r.cols[i].val.c_str(), nullptr);
+		}
+	}
+	return 0.0;
+}
+
+/* rows that have the column, best first (ties are ordered by key). Cached until the next change. */
+static const std::vector<int>& IdxGetSorted(Index& ix, const std::string& colIn, bool asc)
+{
+	std::string col = CleanToken(colIn);
+	std::string id  = Lower(col) + (asc ? "+" : "-");
+
+	for (size_t i = 0; i < ix.cache.size(); i++)
+		if (ix.cache[i].id == id) return ix.cache[i].order;
+
+	if (ix.cache.size() > 8)
+		ix.cache.clear();
+
+	std::vector<std::pair<double, int> > tmp;
+	for (size_t i = 0; i < ix.rows.size(); i++)
+	{
+		bool ok = false;
+		double v = IdxNum(ix.rows[i], col, ok);
+		if (ok) tmp.push_back(std::make_pair(v, (int)i));
+	}
+
+	std::sort(tmp.begin(), tmp.end(), [&ix, asc](const std::pair<double, int>& a, const std::pair<double, int>& b)
+	{
+		if (a.first != b.first)
+			return asc ? (a.first < b.first) : (a.first > b.first);
+		return Lower(ix.rows[a.second].key) < Lower(ix.rows[b.second].key);
+	});
+
+	IdxSorted s;
+	s.id = id;
+	for (size_t i = 0; i < tmp.size(); i++)
+		s.order.push_back(tmp[i].second);
+
+	ix.cache.push_back(s);
+	return ix.cache.back().order;
+}
+
+static bool IdxParse(const std::string& path, Index& ix)
+{
+	FILE* f = fopen(path.c_str(), "r");
+	if (!f) return false;
+
+	char line[2048];
+	int cur = -1;
+
+	while (fgets(line, sizeof(line), f))
+	{
+		std::string s = Trimmed(line);
+		if (s.empty() || s[0] == ';' || s[0] == '#')
+			continue;
+
+		if (s[0] == '[' && s[s.size() - 1] == ']')
+		{
+			std::string key = IdxKey(s.substr(1, s.size() - 2));
+			if (key.empty()) { cur = -1; continue; }
+
+			cur = IdxFindRow(ix, key);
+			if (cur < 0) cur = IdxAddRow(ix, key);
+			continue;
+		}
+
+		if (cur < 0) continue;
+
+		size_t eq = s.find('=');
+		if (eq == std::string::npos) continue;
+
+		std::string col = CleanToken(s.substr(0, eq));
+		std::string val = Trimmed(s.substr(eq + 1));
+		if (col.empty()) continue;
+
+		std::vector<KV>& cols = ix.rows[cur].cols;
+		bool found = false;
+		for (size_t i = 0; i < cols.size(); i++)
+		{
+			if (IEq(cols[i].key, col)) { cols[i].val = val; found = true; break; }
+		}
+		if (!found)
+		{
+			KV kv; kv.key = col; kv.val = val;
+			cols.push_back(kv);
+		}
+	}
+	fclose(f);
+	return true;
+}
+
+static bool IdxSave(Index& ix)
+{
+	EnsureIdxDir();
+
+	std::string path = IdxPath(ix.name);
+	std::string tmp  = path + ".tmp";
+
+	FILE* f = fopen(tmp.c_str(), "w");
+	if (!f)
+	{
+		MP_OUT("[MetaProfiler] ERROR: cannot write %s\n", tmp.c_str());
+		return false;
+	}
+
+	fprintf(f, "; MetaProfiler index: %s\n", ix.name.c_str());
+	fprintf(f, "; Rows  : %d\n", (int)ix.rows.size());
+	fprintf(f, "; Saved : %s\n\n", NowString().c_str());
+
+	for (size_t i = 0; i < ix.rows.size(); i++)
+	{
+		fprintf(f, "[%s]\n", ix.rows[i].key.c_str());
+		for (size_t k = 0; k < ix.rows[i].cols.size(); k++)
+			fprintf(f, "%s=%s\n", ix.rows[i].cols[k].key.c_str(), ix.rows[i].cols[k].val.c_str());
+		fputc('\n', f);
+	}
+
+	bool ok = (ferror(f) == 0);
+	fclose(f);
+
+	if (!ok)
+	{
+		remove(tmp.c_str());
+		return false;
+	}
+
+	if (!ReplaceFile(tmp, path))
+	{
+		MP_OUT("[MetaProfiler] ERROR: cannot replace %s\n", path.c_str());
+		return false;
+	}
+
+	ix.dirty = false;
+	g_Saves++;
+	return true;
+}
+
+static void SaveAllIndexes()
+{
+	for (size_t i = 0; i < g_Indexes.size(); i++)
+		if (g_Indexes[i].used && g_Indexes[i].dirty)
+			IdxSave(g_Indexes[i]);
+}
+
+static int IdxOpen(const std::string& nameRaw, bool create)
+{
+	std::string name = MakeKey(nameRaw);
+
+	for (int i = 0; i < MP_MAX_INDEXES; i++)
+		if (g_Indexes[i].used && g_Indexes[i].name == name) return i;
+
+	std::string path = IdxPath(name);
+	bool exists = FileExists(path);
+
+	// crash recovery
+	if (!exists && FileExists(path + ".tmp") && ReplaceFile(path + ".tmp", path))
+		exists = true;
+
+	if (!exists && !create)
+		return -1;
+
+	int s = -1;
+	for (int i = 0; i < MP_MAX_INDEXES; i++)
+		if (!g_Indexes[i].used) { s = i; break; }
+	if (s < 0) return -1;
+
+	Index& ix = g_Indexes[s];
+	ix = Index();
+	ix.used = true;
+	ix.gen  = NextIdxGen();
+	ix.name = name;
+
+	if (exists)
+	{
+		IdxParse(path, ix);
+		g_Loads++;
+	}
+	else
+	{
+		ix.dirty = true;
+	}
+	return s;
 }
 
 // ============================================================
@@ -1382,6 +1795,7 @@ MP_NATIVE(n_diag)
 	MP_OUT("  Log limits       : history %d | chat %d | gameplay %d | names %d | ips %d\n",
 		g_LogLimit[0], g_LogLimit[1], g_LogLimit[2], g_LogLimit[3], g_LogLimit[4]);
 	MP_OUT("  Files saved/read : %u / %u\n", g_Saves, g_Loads);
+	MP_OUT("  Forwards         : %s\n", g_FwdsReady ? "ENABLED" : "DISABLED (enable FN_AMXX_PLUGINSLOADED in moduleconfig.h)");
 
 	int loaded = 0;
 	for (int i = 0; i < MP_MAX_PROFILES; i++) if (g_Profiles[i].used) loaded++;
@@ -1404,9 +1818,325 @@ MP_NATIVE(n_diag)
 			p.dirty ? "NO" : "yes", (int)p.sections.size(), lines);
 	}
 
+	MP_OUT("\n  [INDEXES]\n");
+	MP_OUT("  %-28s %-8s %-8s\n", "Name", "Rows", "Saved");
+	PrintLine('-', 78);
+
+	int idxCount = 0;
+	for (int i = 0; i < MP_MAX_INDEXES; i++)
+	{
+		if (!g_Indexes[i].used) continue;
+		MP_OUT("  %-28s %-8d %-8s\n", g_Indexes[i].name.c_str(), (int)g_Indexes[i].rows.size(), g_Indexes[i].dirty ? "NO" : "yes");
+		idxCount++;
+	}
+	if (!idxCount)
+		MP_OUT("  (none)\n");
+
 	PrintLine('=', 78);
 	MP_OUT("\n");
 	return 1;
+}
+
+// ============================================================
+//  Natives: indexes
+// ============================================================
+
+#define MP_GETI(var, idx)  Index* var = IdxFromHandle(params[idx]); if (!var) return 0;
+
+// MPIndex:metaprofiler_index_open(const name[], bool:create = true)
+MP_NATIVE(n_idx_open)
+{
+	bool create = (MP_ParamCount(params) >= 2) ? (params[2] != 0) : true;
+	int s = IdxOpen(Str(amx, params[1]), create);
+	return (s >= 0) ? IdxHandle(s) : 0;
+}
+
+MP_NATIVE(n_idx_exists)
+{
+	std::string name = MakeKey(Str(amx, params[1]));
+
+	for (int i = 0; i < MP_MAX_INDEXES; i++)
+		if (g_Indexes[i].used && g_Indexes[i].name == name) return 1;
+
+	return FileExists(IdxPath(name)) ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_is_valid) { return IdxFromHandle(params[1]) ? 1 : 0; }
+
+// metaprofiler_index_delete(const name[]) : removes the file and unloads the index
+MP_NATIVE(n_idx_delete)
+{
+	std::string name = MakeKey(Str(amx, params[1]));
+
+	for (int i = 0; i < MP_MAX_INDEXES; i++)
+		if (g_Indexes[i].used && g_Indexes[i].name == name) g_Indexes[i] = Index();
+
+	return remove(IdxPath(name).c_str()) == 0 ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_clear)
+{
+	MP_GETI(ix, 1);
+	ix->rows.clear();
+	ix->map.clear();
+	ix->cache.clear();
+	ix->dirty = true;
+	return 1;
+}
+
+MP_NATIVE(n_idx_save)
+{
+	MP_GETI(ix, 1);
+	return IdxSave(*ix) ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_count)
+{
+	MP_GETI(ix, 1);
+	return (cell)ix->rows.size();
+}
+
+// metaprofiler_index_key_at(index, position, out[], len)
+MP_NATIVE(n_idx_key_at)
+{
+	MP_GETI(ix, 1);
+	int pos = params[2];
+	if (pos < 0 || pos >= (int)ix->rows.size()) return 0;
+	MF_SetAmxString(amx, params[3], ix->rows[pos].key.c_str(), params[4]);
+	return 1;
+}
+
+MP_NATIVE(n_idx_has)
+{
+	MP_GETI(ix, 1);
+	return IdxFindRow(*ix, IdxKey(Str(amx, params[2]))) >= 0 ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_remove)
+{
+	MP_GETI(ix, 1);
+	int n = IdxFindRow(*ix, IdxKey(Str(amx, params[2])));
+	if (n < 0) return 0;
+	IdxRemoveRow(*ix, n);
+	return 1;
+}
+
+// metaprofiler_index_set(index, key, column, value)
+MP_NATIVE(n_idx_set)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	std::string val = MF_GetAmxString(amx, params[4], 2, &len);
+	return IdxSet(*ix, key, col, val) ? 1 : 0;
+}
+
+// metaprofiler_index_get(index, key, column, out[], len, def[] = "")
+MP_NATIVE(n_idx_get)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+
+	std::string out;
+	bool found = IdxGet(*ix, key, col, out);
+	if (!found)
+		out = (MP_ParamCount(params) >= 6) ? Str(amx, params[6]) : "";
+
+	MF_SetAmxString(amx, params[4], out.c_str(), params[5]);
+	return found ? 1 : 0;
+}
+
+static int IdxGetInt(Index& ix, const std::string& key, const std::string& col, int def)
+{
+	std::string v;
+	if (!IdxGet(ix, key, col, v) || v.empty()) return def;
+	return (int)strtol(v.c_str(), nullptr, 10);
+}
+
+MP_NATIVE(n_idx_set_int)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%d", (int)params[4]);
+	return IdxSet(*ix, key, col, buf) ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_get_int)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	return IdxGetInt(*ix, key, col, (MP_ParamCount(params) >= 4) ? params[4] : 0);
+}
+
+MP_NATIVE(n_idx_add_int)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	int amount = (MP_ParamCount(params) >= 4) ? params[4] : 1;
+
+	int v = IdxGetInt(*ix, key, col, 0) + amount;
+	char buf[32];
+	snprintf(buf, sizeof(buf), "%d", v);
+	IdxSet(*ix, key, col, buf);
+	return v;
+}
+
+MP_NATIVE(n_idx_set_float)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	char buf[48];
+	snprintf(buf, sizeof(buf), "%.4f", (double)amx_ctof(params[4]));
+	return IdxSet(*ix, key, col, buf) ? 1 : 0;
+}
+
+MP_NATIVE(n_idx_get_float)
+{
+	MP_GETI(ix, 1);
+	int len;
+	std::string key = MF_GetAmxString(amx, params[2], 0, &len);
+	std::string col = MF_GetAmxString(amx, params[3], 1, &len);
+	double def = (MP_ParamCount(params) >= 4) ? (double)amx_ctof(params[4]) : 0.0;
+
+	std::string v;
+	if (!IdxGet(*ix, key, col, v) || v.empty())
+		return amx_ftoc((float)def);
+	return amx_ftoc((float)strtod(v.c_str(), nullptr));
+}
+
+// metaprofiler_index_top(index, column, position, key[], keylen, &value, bool:ascending = false)
+MP_NATIVE(n_idx_top)
+{
+	MP_GETI(ix, 1);
+	std::string col = Str(amx, params[2]);
+	int pos = params[3];
+	bool asc = (MP_ParamCount(params) >= 7) ? (params[7] != 0) : false;
+
+	const std::vector<int>& order = IdxGetSorted(*ix, col, asc);
+	if (pos < 0 || pos >= (int)order.size()) return 0;
+
+	IdxRow& r = ix->rows[order[pos]];
+	MF_SetAmxString(amx, params[4], r.key.c_str(), params[5]);
+
+	cell* addr = MF_GetAmxAddr(amx, params[6]);
+	if (addr)
+	{
+		bool ok = false;
+		*addr = (cell)IdxNum(r, CleanToken(col), ok);
+	}
+	return 1;
+}
+
+// metaprofiler_index_rank(index, column, key, bool:ascending = false) -> 1 = best, 0 = not ranked
+MP_NATIVE(n_idx_rank)
+{
+	MP_GETI(ix, 1);
+	std::string col = CleanToken(Str(amx, params[2]));
+	std::string key = IdxKey(Str(amx, params[3]));
+	bool asc = (MP_ParamCount(params) >= 4) ? (params[4] != 0) : false;
+
+	int n = IdxFindRow(*ix, key);
+	if (n < 0) return 0;
+
+	bool ok = false;
+	double mine = IdxNum(ix->rows[n], col, ok);
+	if (!ok) return 0;
+
+	int better = 0;
+	for (size_t i = 0; i < ix->rows.size(); i++)
+	{
+		bool ok2 = false;
+		double v = IdxNum(ix->rows[i], col, ok2);
+		if (ok2 && (asc ? (v < mine) : (v > mine))) better++;
+	}
+	return better + 1;
+}
+
+// metaprofiler_index_count_where(index, column, MPOp:op, value)
+MP_NATIVE(n_idx_count_where)
+{
+	MP_GETI(ix, 1);
+	std::string col = CleanToken(Str(amx, params[2]));
+	int op = params[3];
+	double rhs = (double)params[4];
+
+	int n = 0;
+	for (size_t i = 0; i < ix->rows.size(); i++)
+	{
+		bool ok = false;
+		double v = IdxNum(ix->rows[i], col, ok);
+		if (!ok) continue;
+
+		bool pass = false;
+		switch (op)
+		{
+			case MPO_EQ: pass = (v == rhs); break;
+			case MPO_NE: pass = (v != rhs); break;
+			case MPO_GT: pass = (v >  rhs); break;
+			case MPO_GE: pass = (v >= rhs); break;
+			case MPO_LT: pass = (v <  rhs); break;
+			case MPO_LE: pass = (v <= rhs); break;
+		}
+		if (pass) n++;
+	}
+	return n;
+}
+
+// ---- save_step / version ------------------------------------------
+
+// metaprofiler_save_step(max = 4) : saves at most max dirty files (profiles + indexes),
+// returns how many are still waiting. Call it from a timer to spread the disk writes.
+MP_NATIVE(n_save_step)
+{
+	int maxn = (MP_ParamCount(params) >= 1) ? params[1] : 4;
+	if (maxn < 1) maxn = 1;
+
+	int saved = 0;
+
+	for (size_t i = 0; i < g_Profiles.size() && saved < maxn; i++)
+	{
+		if (g_Profiles[i].used && g_Profiles[i].dirty)
+		{
+			SaveProfile(g_Profiles[i]);
+			saved++;
+		}
+	}
+
+	for (size_t i = 0; i < g_Indexes.size() && saved < maxn; i++)
+	{
+		if (g_Indexes[i].used && g_Indexes[i].dirty)
+		{
+			IdxSave(g_Indexes[i]);
+			saved++;
+		}
+	}
+
+	int left = 0;
+	for (size_t i = 0; i < g_Profiles.size(); i++)
+		if (g_Profiles[i].used && g_Profiles[i].dirty) left++;
+	for (size_t i = 0; i < g_Indexes.size(); i++)
+		if (g_Indexes[i].used && g_Indexes[i].dirty) left++;
+
+	return left;
+}
+
+MP_NATIVE(n_version) { return MP_VERSION_NUM; }
+
+MP_NATIVE(n_version_string)
+{
+	return MF_SetAmxString(amx, params[1], MP_VERSION, params[2]);
 }
 
 // ============================================================
@@ -1462,6 +2192,9 @@ AMX_NATIVE_INFO metaprofiler_natives[] =
 	// persistence / config / tools
 	{ "metaprofiler_save",              n_save },
 	{ "metaprofiler_save_all",          n_save_all },
+	{ "metaprofiler_save_step",         n_save_step },
+	{ "metaprofiler_version",           n_version },
+	{ "metaprofiler_version_string",    n_version_string },
 	{ "metaprofiler_reload",            n_reload },
 	{ "metaprofiler_is_dirty",          n_is_dirty },
 	{ "metaprofiler_set_keymode",       n_set_keymode },
@@ -1470,6 +2203,28 @@ AMX_NATIVE_INFO metaprofiler_natives[] =
 	{ "metaprofiler_scan_get",          n_scan_get },
 	{ "metaprofiler_dump",              n_dump },
 	{ "metaprofiler_diag",              n_diag },
+
+	// indexes
+	{ "metaprofiler_index_open",        n_idx_open },
+	{ "metaprofiler_index_exists",      n_idx_exists },
+	{ "metaprofiler_index_is_valid",    n_idx_is_valid },
+	{ "metaprofiler_index_delete",      n_idx_delete },
+	{ "metaprofiler_index_clear",       n_idx_clear },
+	{ "metaprofiler_index_save",        n_idx_save },
+	{ "metaprofiler_index_count",       n_idx_count },
+	{ "metaprofiler_index_key_at",      n_idx_key_at },
+	{ "metaprofiler_index_has",         n_idx_has },
+	{ "metaprofiler_index_remove",      n_idx_remove },
+	{ "metaprofiler_index_set",         n_idx_set },
+	{ "metaprofiler_index_get",         n_idx_get },
+	{ "metaprofiler_index_set_int",     n_idx_set_int },
+	{ "metaprofiler_index_get_int",     n_idx_get_int },
+	{ "metaprofiler_index_add_int",     n_idx_add_int },
+	{ "metaprofiler_index_set_float",   n_idx_set_float },
+	{ "metaprofiler_index_get_float",   n_idx_get_float },
+	{ "metaprofiler_index_top",         n_idx_top },
+	{ "metaprofiler_index_rank",        n_idx_rank },
+	{ "metaprofiler_index_count_where", n_idx_count_where },
 
 	{ nullptr, nullptr }
 };
@@ -1481,13 +2236,27 @@ AMX_NATIVE_INFO metaprofiler_natives[] =
 void OnAmxxAttach()
 {
 	g_Profiles.assign(MP_MAX_PROFILES, Profile());
+	g_Indexes.assign(MP_MAX_INDEXES, Index());
 	EnsureDir();
 	MF_AddNatives(metaprofiler_natives);
 	MP_OUT("[MetaProfiler] v%s loaded successfully.\n", MP_VERSION);
 }
 
+void OnPluginsLoaded()
+{
+	// forwards must be registered after the plugins are loaded
+	g_FwdCreated = MF_RegisterForward("metaprofiler_profile_created", ET_IGNORE, FP_CELL, FP_CELL, FP_DONE);
+	g_FwdLoaded  = MF_RegisterForward("metaprofiler_profile_loaded",  ET_IGNORE, FP_CELL, FP_CELL, FP_DONE);
+	g_FwdClosing = MF_RegisterForward("metaprofiler_profile_closing", ET_IGNORE, FP_CELL, FP_CELL, FP_DONE);
+	g_FwdRenamed = MF_RegisterForward("metaprofiler_profile_renamed", ET_IGNORE, FP_CELL, FP_CELL, FP_CELL, FP_DONE);
+	g_FwdsReady  = true;
+}
+
 void OnPluginsUnloaded()
 {
+	// the plugins are going away: do not call into them any more
+	g_FwdsReady = false;
+
 	// map change: close every session and flush to disk
 	for (int id = 1; id <= MP_MAX_PLAYERS; id++)
 		if (g_Players[id].slot >= 0) DoDisconnect(id);
@@ -1496,6 +2265,7 @@ void OnPluginsUnloaded()
 
 void OnAmxxDetach()
 {
+	g_FwdsReady = false;
 	for (int id = 1; id <= MP_MAX_PLAYERS; id++)
 		if (g_Players[id].slot >= 0) DoDisconnect(id);
 	SaveAll();
