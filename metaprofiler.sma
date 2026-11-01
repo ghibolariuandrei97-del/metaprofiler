@@ -2,10 +2,11 @@
 #include <metaprofiler>
 
 #define PLUGIN  "MetaProfiler Collector"
-#define VERSION "1.1.0"
+#define VERSION "1.2.0"
 #define AUTHOR  "you"
 
-#define AUTOSAVE_INTERVAL 120.0
+#define AUTOSAVE_INTERVAL 10.0   // seconds between save steps
+#define SAVES_PER_STEP    6      // files written per step (spreads the disk writes)
 
 // extra sections used by this plugin
 #define MP_SEC_LAST      "Last"
@@ -56,7 +57,8 @@ public plugin_end()
 
 public task_autosave()
 {
-	metaprofiler_save_all();
+	// writes a few changed files at a time instead of everything at once
+	metaprofiler_save_step(SAVES_PER_STEP);
 }
 
 // ============================================================
