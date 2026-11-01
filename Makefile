@@ -1,5 +1,5 @@
 NAME = metaprofiler
-SOURCES = amxmodmodule.cpp metaprofiler.cpp
+SOURCES = $(wildcard *.cpp)
 
 CXX = g++
 CXXFLAGS = -fPIC -O2 -m32 -std=c++17 -I. -DMETA_NO_HLSDK -DHAVE_STDINT_H -DNDEBUG
