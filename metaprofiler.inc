@@ -4,7 +4,7 @@
 #define _metaprofiler_included
 
 // ============================================================
-//  MetaProfiler v1.0.0 - Persistent Player Profile Engine
+//  MetaProfiler v1.1.0 - Persistent Player Profile Engine
 //  One .ini file per player: addons/amxmodx/data/metaprofiler/<key>.ini
 // ============================================================
 //
@@ -14,6 +14,14 @@
 //  file. The module only STORES and READS data. A collector plugin
 //  (metaprofiler.sma) watches the game and feeds the module, but ANY
 //  plugin can read and write profile data with the natives below.
+//
+//  TWO PARTS
+//  ---------
+//  1) PROFILES : one .ini per player (key/value + logs). See "KEY / VALUE API".
+//  2) INDEXES  : independent tables (rows = any key, columns = any name) with
+//                top / rank / filters. They do NOT read profiles and do not need
+//                the collector: any plugin can create its own ranking.
+//                See "INDEXES".
 //
 //  QUICK START
 //  -----------
@@ -81,6 +89,12 @@
 enum MPProfile
 {
 	MP_INVALID = 0
+};
+
+/* Index handle. MP_INDEX_INVALID (0) means "no index" / failure. */
+enum MPIndex
+{
+	MP_INDEX_INVALID = 0
 };
 
 /* Log sections stored at the bottom of each profile.
@@ -567,6 +581,217 @@ native metaprofiler_dump(MPProfile:profile);
  * log limits, counters and a table of the profiles loaded in memory.
  */
 native metaprofiler_diag();
+
+// ============================================================
+//  INDEXES  (independent tables - separate from profiles)
+// ============================================================
+//
+//  An index is a table saved in
+//      addons/amxmodx/data/metaprofiler/indexes/<name>.ini
+//  - ROWS are identified by a key (a name, a SteamID, anything). Keys are
+//    case-insensitive, max 64 characters, the characters [ ] = ; are replaced with "_".
+//  - COLUMNS are free: set any column name on any row.
+//  - Sorting, top and rank only work on NUMERIC columns. A row without the
+//    column (or with an empty value) is not part of that ranking.
+//  - Everything is kept in memory; an index is written to disk by
+//    metaprofiler_index_save(), metaprofiler_save_all(), metaprofiler_save_step()
+//    and when the map changes. Tens of thousands of rows are fine.
+//  - You can open up to 16 indexes at the same time.
+//
+//  EXAMPLE: a simple ranking plugin
+//
+//      new MPIndex:g_idx;
+//
+//      public plugin_init()
+//      {
+//          g_idx = metaprofiler_index_open("rank");           // creates it if missing
+//      }
+//
+//      // when a player scores:
+//      metaprofiler_index_add_int(g_idx, name, "score", 3);
+//
+//      // top 10:
+//      new key[32], value;
+//      for (new i = 0; i < 10; i++)
+//      {
+//          if (!metaprofiler_index_top(g_idx, "score", i, key, charsmax(key), value))
+//              break;
+//          server_print("%d. %s - %d", i + 1, key, value);
+//      }
+//
+// ============================================================
+
+/**
+ * Opens an index (loads it from disk, or creates it).
+ * Opening an index that is already open returns the same handle.
+ *
+ * @param name     Index name (becomes the file name, lower-cased)
+ * @param create   true  = create an empty index if it does not exist
+ *                 false = return MP_INDEX_INVALID if it does not exist
+ *
+ * @return         Index handle, or MP_INDEX_INVALID (does not exist, or 16 indexes are open)
+ */
+native MPIndex:metaprofiler_index_open(const name[], bool:create = true);
+
+/* Does an index exist (open, or as a file)? */
+native bool:metaprofiler_index_exists(const name[]);
+
+/* Is the handle usable? */
+native bool:metaprofiler_index_is_valid(MPIndex:index);
+
+/**
+ * Deletes an index: removes the file and unloads it. This cannot be undone.
+ * Existing handles of this index become invalid.
+ *
+ * @return         true if the file was deleted
+ */
+native bool:metaprofiler_index_delete(const name[]);
+
+/* Removes ALL rows of an index (the index itself stays open). */
+native bool:metaprofiler_index_clear(MPIndex:index);
+
+/* Saves the index to disk now (safe write: temporary file, then replace). */
+native bool:metaprofiler_index_save(MPIndex:index);
+
+/* Number of rows. */
+native metaprofiler_index_count(MPIndex:index);
+
+/**
+ * Enumerates the rows (to loop over every row). The order is not sorted
+ * and can change when rows are removed. Use metaprofiler_index_top() for sorted lists.
+ *
+ * @param position  0 to metaprofiler_index_count() - 1
+ *
+ * @return          false if the position is out of range
+ */
+native bool:metaprofiler_index_key_at(MPIndex:index, position, out[], len);
+
+/* Does the row exist? */
+native bool:metaprofiler_index_has(MPIndex:index, const key[]);
+
+/* Deletes a row. Returns true if it existed. */
+native bool:metaprofiler_index_remove(MPIndex:index, const key[]);
+
+/**
+ * Writes a text value (creates the row and the column if needed).
+ * Text columns cannot be sorted, use them for names, clans, notes...
+ *
+ * @return         true on success, false if the key or column is empty
+ */
+native bool:metaprofiler_index_set(MPIndex:index, const key[], const column[], const value[]);
+
+/**
+ * Reads a text value.
+ *
+ * @return         true if it exists. If false, out[] = def[].
+ */
+native bool:metaprofiler_index_get(MPIndex:index, const key[], const column[], out[], len, const def[] = "");
+
+/* Whole numbers. get_int returns def if the row or column does not exist. */
+native bool:metaprofiler_index_set_int(MPIndex:index, const key[], const column[], value);
+native metaprofiler_index_get_int(MPIndex:index, const key[], const column[], def = 0);
+
+/**
+ * Adds to a number (a missing row / column starts at 0). Use a negative amount to subtract.
+ * Example: metaprofiler_index_add_int(idx, "john", "kills");
+ *
+ * @return         The new value
+ */
+native metaprofiler_index_add_int(MPIndex:index, const key[], const column[], amount = 1);
+
+/* Decimal numbers (stored with 4 decimals). */
+native bool:metaprofiler_index_set_float(MPIndex:index, const key[], const column[], Float:value);
+native Float:metaprofiler_index_get_float(MPIndex:index, const key[], const column[], Float:def = 0.0);
+
+/**
+ * Sorted list: gets the row at a position when the index is sorted by a numeric column.
+ * Position 0 = first place. Ties are ordered by key, so the list is always the same.
+ * The sorted list is cached until the index changes, so reading a whole top is cheap.
+ *
+ * @param column     Numeric column to sort by
+ * @param position   0 = best. Returns false when there are no more rows
+ * @param key        Receives the row key
+ * @param keylen     Size of key[], use charsmax(key)
+ * @param value      Receives the (whole) value of the column
+ * @param ascending  false = highest first (default), true = lowest first
+ *
+ * @return           true on success, false if the position is out of range
+ */
+native bool:metaprofiler_index_top(MPIndex:index, const column[], position, key[], keylen, &value, bool:ascending = false);
+
+/**
+ * Place of a row in the ranking of a numeric column. 1 = first place.
+ * Rows with the same value share the same place (1, 2, 2, 4...).
+ *
+ * @return         The place, or 0 if the row does not exist or has no value in this column
+ */
+native metaprofiler_index_rank(MPIndex:index, const column[], const key[], bool:ascending = false);
+
+/**
+ * Counts the rows whose numeric column passes a comparison.
+ * Example: how many players have 100 kills or more?
+ *     metaprofiler_index_count_where(idx, "kills", MPOP_GE, 100);
+ */
+native metaprofiler_index_count_where(MPIndex:index, const column[], MPOp:op, value);
+
+// ============================================================
+//  FORWARDS  (events the module sends to plugins)
+// ============================================================
+//
+//  Implement them as public functions in your plugin:
+//
+//      public metaprofiler_profile_loaded(id, MPProfile:profile)
+//      {
+//          client_print(id, print_chat, "Welcome back!");
+//      }
+//
+//  IMPORTANT: forwards only work if these two lines are enabled in the
+//  module's moduleconfig.h (then rebuild the module):
+//
+//      #define FN_AMXX_PLUGINSLOADED   OnPluginsLoaded
+//      #define FN_AMXX_PLUGINSUNLOADED OnPluginsUnloaded
+//
+//  Without them the module still works, but forwards are never sent
+//  (metaprofiler_diag() shows "Forwards: DISABLED").
+//
+//  They are fired when the collector plugin (or any plugin) calls
+//  metaprofiler_player_connect(), metaprofiler_player_disconnect() or
+//  metaprofiler_player_rename().
+//
+
+/* A player's profile was created for the very first time (fired before ..._loaded). */
+forward metaprofiler_profile_created(id, MPProfile:profile);
+
+/* A player's profile is loaded and bound to the player (every connect). */
+forward metaprofiler_profile_loaded(id, MPProfile:profile);
+
+/* The player is leaving: the last chance to write to the profile, it is saved right after.
+   Also fired on map change (the collector closes every session). */
+forward metaprofiler_profile_closing(id, MPProfile:profile);
+
+/* The player changed name and, in MPKEY_NAME mode, moved to another profile.
+   oldprofile was already closed (..._closing fired for it), newprofile is already loaded. */
+forward metaprofiler_profile_renamed(id, MPProfile:oldprofile, MPProfile:newprofile);
+
+// ============================================================
+//  SAVING IN STEPS / VERSION
+// ============================================================
+
+/**
+ * Saves at most "limit" files that have unsaved changes (profiles and indexes),
+ * and returns how many are still waiting. Call it from a repeating timer
+ * (for example every 10 seconds) to spread the disk writes instead of
+ * saving everything at once.
+ *
+ * @return         Number of files still waiting to be saved
+ */
+native metaprofiler_save_step(limit = 4);
+
+/* Module version as a number: 110 = v1.1.0. Use it to check that the module is new enough. */
+native metaprofiler_version();
+
+/* Module version as text, for example "1.1.0". */
+native metaprofiler_version_string(out[], len);
 
 // ============================================================
 //  STOCKS  (small shortcuts, they only use the natives above)
